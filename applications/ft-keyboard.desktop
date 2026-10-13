@@ -1,0 +1,8 @@
+[Desktop Entry]
+Type=Application
+Name=Full Keyboard
+Comment=104-key on-screen keyboard (F-keys, arrows, numpad) for the Frametop desktop
+Exec=/home/steamos/.local/bin/ft-keyboard --toggle
+Icon=input-keyboard
+Categories=Utility;Accessibility;
+StartupNotify=false

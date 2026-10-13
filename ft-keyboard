@@ -1,0 +1,174 @@
+#!/usr/bin/python3 -I
+"""ft-keyboard: a full-size (104-key US) on-screen keyboard for the Frametop desktop, with
+F-keys, the navigation block and a numpad, which Frametop's own laptop-layout keyboard lacks.
+
+Keys go to whatever has keyboard focus on the desktop, the same way Frametop's keyboard sends
+them (`key CODE VALUE` datagrams to ft-screens' @ft_screens). The window never takes focus
+itself (a KWin rule: accept focus off), so clicking it doesn't steal typing. A key goes down
+on press and up on release, so holding repeats. Shift, Ctrl, Alt, AltGr and Meta latch for the
+next key; tap again to drop them.
+
+  ft-keyboard           open it (as a floating window: ft-float run, pin it where you like)
+  ft-keyboard --toggle  close it if it's open, else open it (map a controller button to
+                        command:ft-keyboard --toggle in Frametop Input Settings > Buttons)
+  ft-keyboard --plain   open it as an ordinary window
+"""
+import os
+import signal
+import socket
+import subprocess
+import sys
+
+import gi
+
+gi.require_version("Gtk", "4.0")
+from gi.repository import Gtk  # noqa: E402
+
+FT_FLOAT = os.path.expanduser("~/Programs/frametop/float/ft-float")
+MODIFIERS = {42, 54, 29, 97, 56, 100, 125}  # shifts, ctrls, alts, meta
+
+# (label, evdev code, width in key units); None code = a gap
+MAIN = [
+    [("Esc", 1, 1), (None, None, 1), ("F1", 59, 1), ("F2", 60, 1), ("F3", 61, 1), ("F4", 62, 1),
+     (None, None, .5), ("F5", 63, 1), ("F6", 64, 1), ("F7", 65, 1), ("F8", 66, 1), (None, None, .5),
+     ("F9", 67, 1), ("F10", 68, 1), ("F11", 87, 1), ("F12", 88, 1)],
+    [("`", 41, 1), ("1", 2, 1), ("2", 3, 1), ("3", 4, 1), ("4", 5, 1), ("5", 6, 1), ("6", 7, 1),
+     ("7", 8, 1), ("8", 9, 1), ("9", 10, 1), ("0", 11, 1), ("-", 12, 1), ("=", 13, 1), ("⌫", 14, 2)],
+    [("Tab", 15, 1.5)] + [(c.upper(), k, 1) for c, k in zip("qwertyuiop", range(16, 26))]
+    + [("[", 26, 1), ("]", 27, 1), ("\\", 43, 1.5)],
+    [("Caps", 58, 1.75)] + [(c.upper(), k, 1) for c, k in zip("asdfghjkl", range(30, 39))]
+    + [(";", 39, 1), ("'", 40, 1), ("Enter", 28, 2.25)],
+    [("Shift", 42, 2.25)] + [(c.upper(), k, 1) for c, k in zip("zxcvbnm", range(44, 51))]
+    + [(",", 51, 1), (".", 52, 1), ("/", 53, 1), ("Shift", 54, 2.75)],
+    [("Ctrl", 29, 1.25), ("Meta", 125, 1.25), ("Alt", 56, 1.25), ("", 57, 6.25), ("AltGr", 100, 1.25),
+     ("Menu", 127, 1.25), (None, None, 1.25), ("Ctrl", 97, 1.25)],
+]
+NAV = [
+    [("PrtSc", 99, 1), ("ScrLk", 70, 1), ("Pause", 119, 1)],
+    [("Ins", 110, 1), ("Home", 102, 1), ("PgUp", 104, 1)],
+    [("Del", 111, 1), ("End", 107, 1), ("PgDn", 109, 1)],
+    [],
+    [(None, None, 1), ("↑", 103, 1)],
+    [("←", 105, 1), ("↓", 108, 1), ("→", 106, 1)],
+]
+PAD = [  # (label, code, column, row, width, height) on the numpad grid
+    ("Num", 69, 0, 1, 1, 1), ("/", 98, 1, 1, 1, 1), ("*", 55, 2, 1, 1, 1), ("-", 74, 3, 1, 1, 1),
+    ("7", 71, 0, 2, 1, 1), ("8", 72, 1, 2, 1, 1), ("9", 73, 2, 2, 1, 1), ("+", 78, 3, 2, 1, 2),
+    ("4", 75, 0, 3, 1, 1), ("5", 76, 1, 3, 1, 1), ("6", 77, 2, 3, 1, 1),
+    ("1", 79, 0, 4, 1, 1), ("2", 80, 1, 4, 1, 1), ("3", 81, 2, 4, 1, 1), ("Enter", 96, 3, 4, 1, 2),
+    ("0", 82, 0, 5, 2, 1), (".", 83, 2, 5, 1, 1),
+]
+Q = 4  # grid columns per key unit (quarter keys)
+
+CSS = b"""
+window { background: #1e1f22; }
+button.key { min-width: 0; min-height: 0; padding: 0; margin: 1px; font-size: 15px;
+             background: #3a3c41; color: #eee; border-radius: 6px; }
+button.key:hover { background: #50535a; }
+button.key:active { background: #5b8def; }
+button.key.latched { background: #5b8def; color: white; }
+"""
+
+
+class Keyboard(Gtk.ApplicationWindow):
+    def __init__(self, app):
+        super().__init__(application=app, title="Keyboard")
+        self.set_default_size(1180, 330)
+        self.set_focusable(False)
+        self.sock = socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM)
+        self.latched = {}  # code -> button
+
+        css = Gtk.CssProvider()
+        css.load_from_data(CSS)
+        Gtk.StyleContext.add_provider_for_display(self.get_display(), css,
+                                                  Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION)
+        outer = Gtk.Box(spacing=int(Q * 2))
+        for side in ("top", "bottom", "start", "end"):
+            getattr(outer, f"set_margin_{side}")(6)
+        self.set_child(outer)
+        outer.append(self.rows_grid(MAIN))
+        outer.append(self.rows_grid(NAV))
+        pad = self.grid()
+        for label, code, col, row, w, h in PAD:
+            pad.attach(self.key(label, code), col * Q, row, w * Q, h)
+        outer.append(pad)
+
+    def grid(self):
+        g = Gtk.Grid(row_homogeneous=True, column_homogeneous=True)
+        g.set_hexpand(True)
+        g.set_vexpand(True)
+        return g
+
+    def rows_grid(self, rows):
+        g = self.grid()
+        for r, row in enumerate(rows):
+            col = 0
+            for label, code, width in row:
+                span = round(width * Q)
+                if code is not None:
+                    g.attach(self.key(label, code), col, r, span, 1)
+                col += span
+        if not any(rows[3]):  # keep an empty row its height
+            g.attach(Gtk.Label(), 0, 3, 1, 1)
+        return g
+
+    def key(self, label, code):
+        b = Gtk.Button(label=label)
+        b.add_css_class("key")
+        b.set_focusable(False)
+        b.set_hexpand(True)
+        b.set_vexpand(True)
+        click = Gtk.GestureClick()
+        click.set_propagation_phase(Gtk.PropagationPhase.CAPTURE)
+        click.connect("pressed", lambda *_: self.down(code, b))
+        click.connect("released", lambda *_: self.up(code))
+        click.connect("cancel", lambda *_: self.up(code))
+        b.add_controller(click)
+        return b
+
+    # --- keys --------------------------------------------------------------------------------
+    def send(self, code, value):
+        try:
+            self.sock.sendto(f"key {code} {value}".encode(), "\0ft_screens")
+        except OSError:
+            pass
+
+    def down(self, code, button):
+        if code in MODIFIERS:
+            if code in self.latched:
+                self.latched.pop(code).remove_css_class("latched")
+            else:
+                self.latched[code] = button
+                button.add_css_class("latched")
+            return
+        for mod in self.latched:
+            self.send(mod, 1)
+        self.send(code, 1)
+
+    def up(self, code):
+        if code in MODIFIERS:
+            return
+        self.send(code, 0)
+        for mod, button in self.latched.items():
+            self.send(mod, 0)
+            button.remove_css_class("latched")
+        self.latched.clear()
+
+
+def main():
+    if "--toggle" in sys.argv:
+        running = subprocess.run(["pgrep", "-f", f"^/usr/bin/python3 -I {os.path.abspath(sys.argv[0])} --plain$"], capture_output=True, text=True)
+        pids = [int(p) for p in running.stdout.split() if int(p) != os.getpid()]
+        if pids:
+            for pid in pids:
+                os.kill(pid, signal.SIGTERM)
+            return
+    if "--plain" not in sys.argv and os.path.exists(FT_FLOAT):
+        os.execv(FT_FLOAT, ["ft-float", "run", os.path.abspath(sys.argv[0]), "--plain"])
+    app = Gtk.Application(application_id="local.ft.keyboard")
+    app.connect("activate", lambda a: (a.get_active_window() or Keyboard(a)).present())
+    app.run(None)
+
+
+if __name__ == "__main__":
+    main()

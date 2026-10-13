@@ -1,0 +1,8 @@
+[Desktop Entry]
+Type=Application
+Name=Chord Keyboard
+Comment=Type with both Frame controllers' thumbsticks (tap the left view button to toggle)
+Exec=/home/steamos/.local/bin/ft-chord --toggle
+Icon=input-gaming
+Categories=Utility;Accessibility;
+StartupNotify=false

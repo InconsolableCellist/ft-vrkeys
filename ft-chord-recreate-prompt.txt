@@ -1,0 +1,267 @@
+PROMPT: Build "ft-chord", a two-thumbstick chord keyboard for a Valve Steam Frame
+==================================================================================
+
+The only thing assumed: you're on a Steam Frame (SteamOS, aarch64, user "steamos" by default) in its
+desktop mode, with SteamVR running and both Frame controllers on. Build $HOME/.local/bin/ft-chord: a
+small HUD window plus a chord engine that lets a user with only the two controllers in hand (no
+physical keyboard, often reclining) type into the desktop with both thumbsticks.
+
+Reference images of the finished HUD may be attached; if so, match them. images/ft-chord-idle.png shows it
+with nothing held. images/ft-chord-typing.png shows the left stick up (group "hld..."), the right stick at NW
+("m"), and "Hello wor_" typed so far. If $HOME/.local/bin/ft-chord already exists, read it first.
+Everything in section 2 was learned by testing on a Frame. Trust it over general OpenVR knowledge.
+
+------------------------------------------------------------------------------------------------
+0. CHECK THE ENVIRONMENT FIRST
+------------------------------------------------------------------------------------------------
+
+Run these and decide which variant you're building:
+
+  cat /etc/os-release | head -3        # expect SteamOS
+  pgrep -a vrserver                    # SteamVR must be running (the controller socket lives in it)
+  curl -s -H 'Referer: http://127.0.0.1:27062/dashboard/controllerbinding.html' \
+       http://127.0.0.1:27062/input/getstate.json | head -c 300   # must return JSON
+  python3 -c 'import gi; gi.require_version("Gtk","4.0"); from gi.repository import Gtk; import cairo; print("ok")'
+  ls -l /dev/uinput; id                # plain-desktop key output needs rw on /dev/uinput (group input)
+  ls ~/Programs/frametop 2>/dev/null; pgrep -af ft-screens   # is Frametop installed and running?
+
+Frametop or not:
+- FRAMETOP (github.com/Frametop/frametop) is an optional third-party project. It runs a KDE Plasma
+  desktop inside VR as floating screens. If `pgrep -af ft-screens` shows it running, build the
+  Frametop variant. It sends keys through Frametop's compositor, and the HUD floats as its own VR
+  panel. Don't install Frametop just for this: its installer
+  (curl -fsSL https://frametop.github.io/frametop/get.sh | bash, from Konsole on the Frame) restarts
+  SteamVR and changes a lot. Only do it if the user asks. A checkout usually lives at
+  ~/Programs/frametop.
+- PLAIN DESKTOP (no Frametop): SteamOS's normal desktop mode (KDE Plasma, KWin Wayland). Keys go
+  through a virtual keyboard on /dev/uinput, and the HUD is an ordinary always-on-top window.
+  Everything else is the same.
+
+Build tools:
+- Needed: nothing beyond the stock SteamOS image. The program is plain Python on the system
+  interpreter (#!/usr/bin/python3 -I) with PyGObject + GTK4 + pycairo, all preinstalled (checked:
+  python 3.12, python-gobject 3.48, gtk4 4.14, python-cairo 1.26). Use only the standard library
+  beyond those: python-evdev and websockets are NOT installed. Don't pip-install into the system
+  Python, and don't try pacman: the SteamOS root filesystem is read-only and the user has no
+  passwordless sudo.
+- Optional, only for OpenVR experiments (you shouldn't need any): g++ and clang exist on the host.
+  The OpenVR library is SteamVR's own (/opt/steamvr/bin/linuxarm64/libopenvr_api.so). The header is
+  not on the system: fetch openvr.h from github.com/ValveSoftware/openvr (Frametop pins v2.15.6 and
+  keeps a copy at ~/Programs/frametop/screens/build/include/openvr.h).
+
+------------------------------------------------------------------------------------------------
+1. HARD-WON FACTS
+------------------------------------------------------------------------------------------------
+
+Reading the controllers
+- DO NOT use SteamVR input (IVRInput action manifests) from an overlay or background app. On the
+  Frame, global action sets (setting steamvr/globalActionSetPriority, "Enable global input from
+  overlays") are effectively dead. A probe whose manifest and bindings SteamVR loaded without error
+  still saw bActive=0 for every action, poses included, at both Min+0x200 and Max global priority.
+  Frametop's own controller button mapping uses this route and never worked for this user.
+  IVRSystem::GetControllerState only answers overlay apps while a VR game runs. Don't spend time on
+  these again.
+- What works: vrserver's undocumented local web socket on 127.0.0.1:27062, which SteamVR's
+  controller-binding web page uses. It reports every component of both controllers at once, whatever
+  app has input focus. It only reads: it takes nothing from SteamVR, the laser, or a game. It exists
+  only while SteamVR runs, and a SteamVR update could change it, so reconnect in a loop and log
+  failures.
+  Protocol (write your own small stdlib RFC 6455 client: socket + base64 + os.urandom + struct +
+  select; ~150 lines. Frametop has one at ~/Programs/frametop/input/vrws.py you may copy if present):
+    - Devices: HTTP GET http://127.0.0.1:27062/input/getstate.json with header
+      Referer: http://127.0.0.1:27062/dashboard/controllerbinding.html. The JSON has "devices": [...].
+      Keep those with controller_type == "frame_controller" and side in (left, right); key them by
+      "root_path" (normally /user/hand/left and /user/hand/right; with some virtual devices, such as
+      Frametop's 3D mouse, a controller can show up as /devices/cv/<serial>). Look them up again when a
+      message comes from an unknown device (rate-limit that to every 2 s), and every ~30 s.
+    - Handshake: GET / HTTP/1.1 with Upgrade: websocket, Connection: Upgrade, Sec-WebSocket-Key,
+      Sec-WebSocket-Version: 13, Origin: http://127.0.0.1:27062 and the same Referer. Expect 101.
+      Client frames must be masked; answer pings (opcode 9) with pongs; reassemble fragments.
+    - Send text frames: "mailbox_open <unique name>", then for each controller path:
+      mailbox_send input_server {"type":"request_input_state_updates","device_path":"<path>","returnAddress":"<name>"}
+    - Messages arrive as JSON text: {"type":"update_component_states","device":"/user/hand/right",
+      "components":{"/input/thumbstick/x":0.42,"/input/a/click":true,...}} (changed components only).
+  Components on the Frame controllers:
+    left : thumbstick/x, thumbstick/y, thumbstick/click, trigger/value, trigger/click, grip/value,
+           grip/click, bumper/click, dpad_up|down|left|right/click, view/click, system/click
+    right: thumbstick/x|y|click, trigger/value|click, grip/value|click, bumper/click, a, b, x, y
+           (all four face buttons are on the RIGHT controller), menu/click, system/click
+    plus /input/capsense/* (per-finger capacitive floats) and */touch. Those are ~95% of the
+    ~190 messages a second, so filter early: only parse texts containing "thumbstick/" or "/click".
+  Thumbstick y is positive UP. Values are finely sampled but arrive in batches about every 100 ms, in
+  order. No flick is lost, but expect up to ~0.1 s latency. Commit-on-release chording tolerates it.
+- Because the socket only reads, every button still does whatever SteamVR or a game binds it to.
+  Don't use the trigger for typing (it clicks wherever SteamVR's laser points). Bumpers, A/B/X/Y and
+  the left d-pad were free on the desktop. A stick flick may also scroll a panel the laser is on.
+- Haptics aren't available through the socket. Skip them.
+
+Sending keys
+- FRAMETOP: send datagrams "key <evdev code> <1|0>" to the abstract unix socket "\0ft_screens"
+  (Frametop's compositor). They go to whatever has keyboard focus on the Frametop desktop. Don't use
+  uinput under Frametop: its input relay assigns roles to new input devices and may grab a new
+  keyboard.
+- PLAIN DESKTOP (this path was designed but NOT tested on the Frame, since the original ran under
+  Frametop; verify it first): create a virtual keyboard on /dev/uinput with fcntl.ioctl (no python-evdev):
+    UI_SET_EVBIT 0x40045564 with EV_KEY=1 (EV_SYN=0 is implied); UI_SET_KEYBIT 0x40045565 for every
+    code you'll send; UI_DEV_SETUP 0x405c5503 with struct uinput_setup = struct.pack("HHHH80sI",
+    BUS_VIRTUAL=0x06, vendor, product, version, b"ft-chord", 0) (92 bytes); UI_DEV_CREATE 0x5501;
+    UI_DEV_DESTROY 0x5502 on exit. Events: os.write(fd, struct.pack("llHHi", 0, 0, type, code, value))
+    (24 bytes on aarch64), each key event followed by an EV_SYN/SYN_REPORT (0, 0, 0). Wait ~0.3 s
+    after creating the device before the first key, so KWin has picked it up. The default steamos user
+    is in group "input", and /dev/uinput is crw-rw-r--+ root:input on the Frame, so no root is needed. If it isn't
+    writable, say so and stop; don't try to change permissions.
+- Either way: send modifier downs before the key and modifier ups after it. Keep a key down for as long
+  as its button is held, so the desktop auto-repeats it (Backspace, arrows).
+
+The HUD window
+- GTK4 + cairo: one Gtk.DrawingArea with a draw func. Never put a text field or focusable widget in
+  it: a text field makes Frametop (and possibly Plasma's virtual keyboard) pop an on-screen keyboard.
+  Call set_focusable(False) on the window. Application id "local.ft.chord".
+- It must never take keyboard focus, or the keys would go to itself. Use a KWin window rule:
+      [ft-chord]
+      Description=Chord keyboard HUD: never takes focus, so typing stays in the app
+      wmclass=local.ft.chord
+      wmclassmatch=1
+      acceptfocus=false
+      acceptfocusrule=2
+      above=true
+      aboverule=2
+  Add it to [General] count= and rules= in kwinrulesrc. WHICH FILE: on a plain desktop it's
+  ~/.config/kwinrulesrc. Under Frametop the desktop runs with XDG_CONFIG_HOME=~/.config/frametop, so
+  it's ~/.config/frametop/kwinrulesrc. Back the file up first. Reload with
+  `qdbus6 org.kde.KWin /KWin reconfigure` on the desktop session's D-Bus. If your shell isn't in that
+  session, take DBUS_SESSION_BUS_ADDRESS from /proc/<pid>/environ of any app process in it (KWin's own
+  environ isn't readable).
+  Frametop caveat: a reconfigure once killed Frametop's input method (ft-textinput), and the OSK stayed
+  broken until a desktop restart. Afterwards check that `pgrep -af ft-textinput` still lists it, and
+  warn the user if it doesn't.
+- FRAMETOP placement: float the HUD as its own VR panel with
+  `~/Programs/frametop/float/ft-float run <abs path to ft-chord> --plain`. That talks to ft-floatd,
+  which launches the program in the desktop's environment, so it works from a service or SSH.
+  ft-floatd remembers each app's floating place, size and scale by app id in
+  ~/.config/frametop-float.json. Its "pixels": [w, h] overrides set_default_size; edit it with the
+  window closed if you change the default size. Users pin a float to a wrist by carrying it by its
+  title bar and sweeping its laser across the ring around the other controller.
+  PLAIN DESKTOP placement: an ordinary window kept above (the rule's above=true). Its place is up to
+  KWin.
+- Toggling: find the running HUD with an ANCHORED pattern:
+  pgrep -f "^/usr/bin/python3 -I <abs path> --plain$". A loose `pgrep -f "ft-chord --plain"` also
+  matches any shell whose command line mentions that text, and it killed the agent's own shell.
+
+Agent-shell gotchas
+- systemctl --user may fail with "Failed to connect to user scope bus". Set
+  XDG_RUNTIME_DIR=/run/user/$(id -u) and DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/$(id -u)/bus.
+- Under Frametop the shell may inherit XDG_CONFIG_HOME=~/.config/frametop, which breaks OpenVR clients
+  ("Installation path could not be located (110)"). Run them with XDG_CONFIG_HOME=~/.config.
+- You can't press controller buttons. For live tests, start a capture in the background and tell the
+  user exactly what to do and for how long. A user's "! cmd" only runs as a command when "!" is the
+  first character of their message.
+
+------------------------------------------------------------------------------------------------
+2. WHAT TO BUILD
+------------------------------------------------------------------------------------------------
+
+One script, $HOME/.local/bin/ft-chord (chmod +x), with modes:
+  ft-chord            open the HUD (Frametop: exec ft-float run <self> --plain; plain: --plain detached)
+  ft-chord --plain    the HUD itself
+  ft-chord --toggle   close the HUD if running (SIGTERM), else open it
+  ft-chord --watch    no window: watch the left view button. A tap (<0.5 s) toggles ft-chord. A hold
+                      toggles a full on-screen keyboard if one exists. Frametop setups may have
+                      ~/.local/bin/ft-keyboard; on a plain desktop, skip the hold or ask the user what
+                      it should open.
+Pick the key output and placement from section 0 at runtime (Frametop if \0ft_screens answers or
+ft-screens is running, else uinput), or ask the user once and hard-code it.
+
+Chord engine (a class fed by the socket reader thread through GLib.idle_add, so all state lives on the
+GTK thread):
+- Directions: 8 sectors from atan2(y, x), in the order E, NE, N, NW, W, SW, S, SE.
+- Left stick: radius >= 0.5 selects group = its direction; otherwise the group is "C" (centred).
+- Right stick: at radius >= 0.6 it's "out"; track the current direction (it can change while out).
+  When the radius drops to <= 0.3 with a direction recorded, type layout[group][direction] and clear.
+  The hysteresis (0.6 out, 0.3 back) prevents double fires from spring-back.
+- Default layout (overridable by ~/.config/ft-chord.json, same shape):
+    C : N e, S t, E a, W o, NE i, NW n, SE s, SW r
+    N : N h, S l, E d, W c, NE u, NW m, SE w, SW f
+    S : N g, S y, E p, W b, NE v, NW k, SE j, SW x
+    E : N q, S z, E ., W ,, NE ?, NW !, SE ', SW -
+    W : N 1, NE 2, E 3, SE 4, S 5, SW 6, W 7, NW 8
+    NE: N 9, S 0, E :, W ;, NE ", NW /, SE (, SW )
+    NW: N @, NE #, E $, SE %, S &, SW *, W +, NW =
+    SE: N _, NE <, E >, SE [, S ], SW {, W }, NW \
+    SW: N Esc, S Tab, E Del, W `, NE ~, NW ^, SE |, SW Home
+  Single characters type themselves (US layout: char -> (evdev code, needs Shift)). Longer names are
+  keys: Space 57, Backspace 14, Enter 28, Tab 15, Esc 1, Del 111, Home 102, End 107, PgUp 104,
+  PgDn 109, Up 103, Down 108, Left 105, Right 106, Ins 110. Shift 42, Ctrl 29, Alt 56.
+  US rows: "1234567890-=" -> 2..13, "qwertyuiop[]" -> 16..27, "asdfghjkl;'`" -> 30..41,
+  "\zxcvbnm,./" -> 43..53. The shifted twins '!@#$%^&*()_+{}:"~|<>?' pair up with
+  "1234567890-=[];'`\,./".
+- Buttons (component -> action):
+    right bumper Space, left bumper Backspace, right a Enter, left d-pad arrows. Each is held down for
+      as long as the button is held, so it repeats.
+    right b Shift: one-shot for the next character. A second press within 0.4 s toggles Caps Lock.
+      Caps is internal: uppercase letters are sent with Shift, and the system Caps Lock stays off.
+    right y Ctrl and right x Alt: latch for the next key; press again to drop.
+  Release every held key when the HUD closes.
+- Keep the last ~40 typed characters for the HUD; Backspace trims it. Show shifted symbols as what
+  they type (Shift+1 shows "!").
+
+HUD drawing (cairo, dark theme, default 660x480):
+- Top captions: "LEFT stick: hold to pick a group" over the left ring and "RIGHT stick: flick, let go =
+  type" over the right ring. Keep them short: a longer left caption got clipped at this width.
+- Left ring: the 8 group labels at their directions (first 3 characters of each group), the current
+  group highlighted blue (#5b8def-ish). Centre text "etaoinsr" while the left stick is centred.
+- Right ring: the current group's 8 outputs at their directions (uppercased while Shift xor Caps),
+  with the current right-stick direction highlighted.
+- Status line: active modifiers (Shift, Caps, Ctrl, Alt) in blue on the left; the typed tail plus "_"
+  as a cursor on the right ("▏" doesn't render in the default font).
+- Legend (bottom ~27%, slightly lighter background): rounded "keycap" chips plus descriptions, in
+  3 rows:
+    [L bumper] Backspace  [R bumper] Space  [A] Enter
+    [B] Shift · 2× Caps   [Y] Ctrl   [X] Alt   [D-pad] arrows
+    [View] tap: close · hold: full keyboard
+  The B, Y and X chips light up while their modifier is on.
+- Check the layout without a headset: factor the drawing into a plain class (or pull the methods out
+  with ast), render it to a cairo.ImageSurface PNG, and look at the PNG.
+
+Socket reader thread: loop { connect, open mailbox "ft_chord_<pid>", subscribe both controllers, read
+messages, post (side, component, kind, value) for kind in x/y/click }. On OSError or ValueError, log
+and retry after 2 s. Stop on a threading.Event set by close-request or SIGTERM.
+
+------------------------------------------------------------------------------------------------
+3. INTEGRATION
+------------------------------------------------------------------------------------------------
+- systemd user service ~/.config/systemd/user/ft-chord-watch.service:
+    [Service] ExecStart=%h/.local/bin/ft-chord --watch, Restart=always, RestartSec=3
+    [Install] WantedBy=default.target
+  then: systemctl --user daemon-reload && systemctl --user enable --now ft-chord-watch.
+  PLAIN DESKTOP: the watcher opens a GTK window, so it needs the desktop session's WAYLAND_DISPLAY and
+  related environment. Either make it a graphical-session service (WantedBy=graphical-session.target,
+  PartOf=graphical-session.target, once Plasma has imported its environment into systemd), or launch
+  the HUD from an autostart .desktop instead. Under Frametop this doesn't matter: ft-float launches
+  it inside the desktop.
+- Launcher ~/.local/share/applications/ft-chord.desktop: Name=Chord Keyboard,
+  Exec=<abs path> --toggle, Icon=input-gaming, StartupNotify=false. To pin it to the Plasma taskbar,
+  use plasmashell scripting rather than editing plasma-org.kde.plasma.desktop-appletsrc while
+  plasmashell runs: qdbus6 org.kde.plasmashell /PlasmaShell org.kde.PlasmaShell.evaluateScript '<JS>'.
+  The JS walks panels() -> widgets() for type org.kde.plasma.icontasks or org.kde.plasma.taskmanager,
+  sets currentConfigGroup=["General"], and appends "applications:ft-chord.desktop" to
+  readConfig("launchers") via writeConfig. Run it on the desktop session's D-Bus.
+
+------------------------------------------------------------------------------------------------
+4. TEST PLAN
+------------------------------------------------------------------------------------------------
+1. Environment: the section 0 checks pass. getstate.json lists two frame_controller devices.
+2. Offline: load the script as a module (importlib SourceFileLoader, since it has no .py suffix).
+   Swap the key sender for a list append, feed simulated flicks (set the left stick, then move the
+   right stick through radii 0.3, 0.7, 1.0, 0.6, 0.2, 0.0), and check the typed text and the code
+   sequence. Two Shift presses in a fast unit test count as a Caps double-tap, so reset the last-shift
+   time between them.
+3. Socket: a 3-second capture (print component changes except capsense and touch) shows both
+   controllers and their resting values. Then run a 30-40 s background capture while the user works
+   both sticks and the buttons at once.
+4. Live: open the HUD with a terminal or text editor focused, and have the user type. Check that the
+   window never takes focus, that held Backspace repeats, and (plain desktop) that the uinput device
+   shows up and types.
+
+Write plain first-person comments, with no marketing tone. Don't add AI attribution lines to commits
+or files.

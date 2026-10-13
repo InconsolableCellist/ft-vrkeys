@@ -1,0 +1,188 @@
+{
+ "action_manifest_version": 0,
+ "controller_type": "frame_controller",
+ "name": "ft-vrkeys probe",
+ "description": "probe",
+ "bindings": {
+  "/actions/keys": {
+   "sources": [
+    {
+     "path": "/user/hand/left/input/trigger",
+     "mode": "trigger",
+     "inputs": {
+      "pull": {
+       "output": "/actions/keys/in/ltrigger"
+      }
+     }
+    },
+    {
+     "path": "/user/hand/left/input/grip",
+     "mode": "trigger",
+     "inputs": {
+      "pull": {
+       "output": "/actions/keys/in/lgrip"
+      }
+     }
+    },
+    {
+     "path": "/user/hand/left/input/thumbstick",
+     "mode": "joystick",
+     "inputs": {
+      "position": {
+       "output": "/actions/keys/in/lstick"
+      },
+      "click": {
+       "output": "/actions/keys/in/lstickclick"
+      },
+      "touch": {
+       "output": "/actions/keys/in/lsticktouch"
+      }
+     }
+    },
+    {
+     "path": "/user/hand/left/input/bumper",
+     "mode": "button",
+     "inputs": {
+      "click": {
+       "output": "/actions/keys/in/lbumper"
+      }
+     }
+    },
+    {
+     "path": "/user/hand/right/input/trigger",
+     "mode": "trigger",
+     "inputs": {
+      "pull": {
+       "output": "/actions/keys/in/rtrigger"
+      }
+     }
+    },
+    {
+     "path": "/user/hand/right/input/grip",
+     "mode": "trigger",
+     "inputs": {
+      "pull": {
+       "output": "/actions/keys/in/rgrip"
+      }
+     }
+    },
+    {
+     "path": "/user/hand/right/input/thumbstick",
+     "mode": "joystick",
+     "inputs": {
+      "position": {
+       "output": "/actions/keys/in/rstick"
+      },
+      "click": {
+       "output": "/actions/keys/in/rstickclick"
+      },
+      "touch": {
+       "output": "/actions/keys/in/rsticktouch"
+      }
+     }
+    },
+    {
+     "path": "/user/hand/right/input/bumper",
+     "mode": "button",
+     "inputs": {
+      "click": {
+       "output": "/actions/keys/in/rbumper"
+      }
+     }
+    },
+    {
+     "path": "/user/hand/right/input/a",
+     "mode": "button",
+     "inputs": {
+      "click": {
+       "output": "/actions/keys/in/a"
+      }
+     }
+    },
+    {
+     "path": "/user/hand/right/input/b",
+     "mode": "button",
+     "inputs": {
+      "click": {
+       "output": "/actions/keys/in/b"
+      }
+     }
+    },
+    {
+     "path": "/user/hand/right/input/x",
+     "mode": "button",
+     "inputs": {
+      "click": {
+       "output": "/actions/keys/in/x"
+      }
+     }
+    },
+    {
+     "path": "/user/hand/right/input/y",
+     "mode": "button",
+     "inputs": {
+      "click": {
+       "output": "/actions/keys/in/y"
+      }
+     }
+    },
+    {
+     "path": "/user/hand/left/input/dpad_up",
+     "mode": "button",
+     "inputs": {
+      "click": {
+       "output": "/actions/keys/in/dpad_up"
+      }
+     }
+    },
+    {
+     "path": "/user/hand/left/input/dpad_down",
+     "mode": "button",
+     "inputs": {
+      "click": {
+       "output": "/actions/keys/in/dpad_down"
+      }
+     }
+    },
+    {
+     "path": "/user/hand/left/input/dpad_left",
+     "mode": "button",
+     "inputs": {
+      "click": {
+       "output": "/actions/keys/in/dpad_left"
+      }
+     }
+    },
+    {
+     "path": "/user/hand/left/input/dpad_right",
+     "mode": "button",
+     "inputs": {
+      "click": {
+       "output": "/actions/keys/in/dpad_right"
+      }
+     }
+    }
+   ],
+   "poses": [
+    {
+     "output": "/actions/keys/in/lpose",
+     "path": "/user/hand/left/pose/tip"
+    },
+    {
+     "output": "/actions/keys/in/rpose",
+     "path": "/user/hand/right/pose/tip"
+    }
+   ],
+   "haptics": [
+    {
+     "output": "/actions/keys/out/lhaptic",
+     "path": "/user/hand/left/output/haptic"
+    },
+    {
+     "output": "/actions/keys/out/rhaptic",
+     "path": "/user/hand/right/output/haptic"
+    }
+   ]
+  }
+ }
+}

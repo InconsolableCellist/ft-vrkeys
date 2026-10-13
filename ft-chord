@@ -1,0 +1,448 @@
+#!/usr/bin/python3 -I
+"""ft-chord: a two-thumbstick chord keyboard for the Frametop desktop, for typing with the
+Frame controllers alone.
+
+Flick the right stick out in one of 8 directions and let it spring back: that types the
+character in that direction. With the left stick centred you get the 8 commonest letters;
+holding the left stick out in a direction first picks another group of 8 (the HUD shows them).
+A character is typed when the right stick comes back to the centre, so until then you can move
+it to another direction. Buttons (see BUTTONS): right bumper space, left bumper backspace,
+A Enter, B Shift (one shot; twice quickly: Caps Lock), Y Ctrl and X Alt (latch for the next
+key), the left d-pad arrows.
+
+The controllers come from vrserver's local web socket (Frametop's input/vrws.py), which reads
+them whatever has input focus and takes nothing from anyone. SteamVR's own input for overlays
+doesn't reach us on the Frame. Keys go to whatever has keyboard focus on the desktop, as
+`key CODE VALUE` datagrams to ft-screens (@ft_screens), like ft-keyboard. The window never takes
+focus (KWin rule for local.ft.chord: accept focus off).
+
+The layout is ~/.config/ft-chord.json if it exists (same shape as LAYOUT below).
+
+  ft-chord            open it (as a floating window, through ft-float run)
+  ft-chord --toggle   close it if it's open, else open it
+  ft-chord --plain    open it as an ordinary window
+  ft-chord --watch    no window: watch the left view button. A tap toggles ft-chord, a hold
+                      (0.5 s) toggles ft-keyboard (the ft-chord-watch user service runs this)
+"""
+import json
+import math
+import os
+import signal
+import socket
+import subprocess
+import sys
+import threading
+import time
+
+sys.path.insert(0, os.path.expanduser("~/Programs/frametop/input"))
+import vrws  # noqa: E402
+
+FT_FLOAT = os.path.expanduser("~/Programs/frametop/float/ft-float")
+CONFIG = os.path.expanduser("~/.config/ft-chord.json")
+DIRS = ["E", "NE", "N", "NW", "W", "SW", "S", "SE"]  # counter-clockwise from east, like atan2
+OUT, BACK = 0.6, 0.3  # stick radius that counts as out, and as back in the centre
+
+# group (the left stick's direction, "C" = centred) -> {right stick direction: what it types}.
+# A single character types itself; a longer name is a key (see NAMED).
+LAYOUT = {
+    "C":  {"N": "e", "S": "t", "E": "a", "W": "o", "NE": "i", "NW": "n", "SE": "s", "SW": "r"},
+    "N":  {"N": "h", "S": "l", "E": "d", "W": "c", "NE": "u", "NW": "m", "SE": "w", "SW": "f"},
+    "S":  {"N": "g", "S": "y", "E": "p", "W": "b", "NE": "v", "NW": "k", "SE": "j", "SW": "x"},
+    "E":  {"N": "q", "S": "z", "E": ".", "W": ",", "NE": "?", "NW": "!", "SE": "'", "SW": "-"},
+    "W":  {"N": "1", "NE": "2", "E": "3", "SE": "4", "S": "5", "SW": "6", "W": "7", "NW": "8"},
+    "NE": {"N": "9", "S": "0", "E": ":", "W": ";", "NE": '"', "NW": "/", "SE": "(", "SW": ")"},
+    "NW": {"N": "@", "NE": "#", "E": "$", "SE": "%", "S": "&", "SW": "*", "W": "+", "NW": "="},
+    "SE": {"N": "_", "NE": "<", "E": ">", "SE": "[", "S": "]", "SW": "{", "W": "}", "NW": "\\"},
+    "SW": {"N": "Esc", "S": "Tab", "E": "Del", "W": "`", "NE": "~", "NW": "^", "SE": "|", "SW": "Home"},
+}
+# controller component -> key name, or a modifier action
+BUTTONS = {
+    ("right", "bumper"): "Space", ("left", "bumper"): "Backspace", ("right", "a"): "Enter",
+    ("right", "b"): "shift", ("right", "y"): "ctrl", ("right", "x"): "alt",
+    ("left", "dpad_up"): "Up", ("left", "dpad_down"): "Down",
+    ("left", "dpad_left"): "Left", ("left", "dpad_right"): "Right",
+}
+NAMED = {"Space": 57, "Backspace": 14, "Enter": 28, "Tab": 15, "Esc": 1, "Del": 111, "Home": 102,
+         "End": 107, "PgUp": 104, "PgDn": 109, "Up": 103, "Down": 108, "Left": 105, "Right": 106,
+         "Ins": 110}
+SHIFT, CTRL, ALT, CAPS = 42, 29, 56, 58
+# US layout: character -> (evdev code, needs shift)
+CHARS = {}
+for row, codes in (("1234567890-=", range(2, 14)), ("qwertyuiop[]", range(16, 28)),
+                   ("asdfghjkl;'`", range(30, 42)), ("\\zxcvbnm,./", range(43, 54))):
+    for c, k in zip(row, codes):
+        CHARS[c] = (k, False)
+for plain, shifted in zip("1234567890-=[];'`\\,./", '!@#$%^&*()_+{}:"~|<>?'):
+    CHARS[shifted] = (CHARS[plain][0], True)
+for c in "abcdefghijklmnopqrstuvwxyz":
+    CHARS[c.upper()] = (CHARS[c][0], True)
+CHARS[" "] = (57, False)
+SHIFTED = dict(zip("1234567890-=[];'`\\,./", '!@#$%^&*()_+{}:"~|<>?'))
+
+
+def direction(x, y):
+    return DIRS[round(math.atan2(y, x) / (math.pi / 4)) % 8]
+
+
+class Chorder:
+    """Stick and button samples in, keys out. Runs on one thread (the GTK main loop)."""
+
+    def __init__(self, layout, changed):
+        self.layout = layout
+        self.changed = changed  # called after anything the HUD shows changes
+        self.sock = socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM)
+        self.stick = {"left": [0.0, 0.0], "right": [0.0, 0.0]}
+        self.group = "C"     # the left stick's direction, as of now
+        self.aim = None      # the right stick's direction while it's out
+        self.peak = 0.0
+        self.shift = False
+        self.caps = False
+        self.last_shift = 0.0
+        self.latched = set()  # ctrl / alt codes for the next key
+        self.held = {}        # button -> code sent down
+        self.typed = ""
+
+    def send(self, code, value):
+        try:
+            self.sock.sendto(f"key {code} {value}".encode(), "\0ft_screens")
+        except OSError:
+            pass
+
+    def tap(self, code, shifted=False):
+        mods = sorted(self.latched) + ([SHIFT] if shifted else [])
+        for m in mods:
+            self.send(m, 1)
+        self.send(code, 1)
+        self.send(code, 0)
+        for m in reversed(mods):
+            self.send(m, 0)
+        self.latched.clear()
+
+    def type(self, what):
+        if len(what) == 1:
+            c = what
+            if c.isalpha() and (self.shift != self.caps):
+                c = c.upper()
+            code, shifted = CHARS[c]
+            if c.isalpha():
+                # Caps Lock here is ours, not the system's: the system's stays off
+                shifted = c.isupper()
+            elif self.shift and not shifted:
+                shifted = True
+                c = SHIFTED.get(c, c)
+            self.tap(code, shifted)
+            self.typed = (self.typed + c)[-40:]
+        else:
+            self.tap(NAMED[what], self.shift)
+            self.typed = (self.typed + {"Space": " ", "Tab": "⇥"}.get(what, "")) [-40:]
+        self.shift = False
+
+    def axis(self, side, axis, value):
+        s = self.stick[side]
+        s[axis] = value
+        r = math.hypot(*s)
+        if side == "left":
+            g = direction(*s) if r >= 0.5 else "C"
+            if g != self.group:
+                self.group = g
+                self.changed()
+            return
+        if r >= OUT:
+            d = direction(*s)
+            if d != self.aim:
+                self.aim = d
+                self.changed()
+            self.peak = max(self.peak, r)
+        elif r <= BACK and self.aim:
+            what = self.layout.get(self.group, {}).get(self.aim)
+            self.aim, self.peak = None, 0.0
+            if what:
+                self.type(what)
+            self.changed()
+
+    def button(self, side, name, down):
+        action = BUTTONS.get((side, name))
+        if not action:
+            return
+        if action == "shift":
+            if down:
+                now = time.monotonic()
+                if now - self.last_shift < 0.4:
+                    self.caps, self.shift = not self.caps, False
+                else:
+                    self.shift = not self.shift
+                self.last_shift = now
+                self.changed()
+            return
+        if action in ("ctrl", "alt"):
+            if down:
+                code = CTRL if action == "ctrl" else ALT
+                self.latched ^= {code}
+                self.changed()
+            return
+        code = NAMED[action]
+        if down:  # held down as long as the button, so the desktop repeats it
+            mods = sorted(self.latched) + ([SHIFT] if self.shift else [])
+            for m in mods:
+                self.send(m, 1)
+            self.send(code, 1)
+            self.held[(side, name)] = (code, mods)
+            if action == "Backspace":
+                self.typed = self.typed[:-1]
+            elif action == "Space":
+                self.typed = (self.typed + " ")[-40:]
+            self.latched.clear()
+            self.shift = False
+            self.changed()
+        elif (side, name) in self.held:
+            code, mods = self.held.pop((side, name))
+            self.send(code, 0)
+            for m in reversed(mods):
+                self.send(m, 0)
+
+    def release_all(self):
+        for code, mods in self.held.values():
+            self.send(code, 0)
+            for m in mods:
+                self.send(m, 0)
+        self.held.clear()
+
+
+def read_controllers(post, stop):
+    """vrserver's socket -> post(side, component, value) for sticks and clicks, reconnecting."""
+    while not stop.is_set():
+        try:
+            ws = vrws.VrSocket()
+            ws.open(f"ft_chord_{os.getpid()}")
+            sides = vrws.controllers()
+            for path in sides:
+                ws.subscribe(path)
+            last_lookup = time.monotonic()
+            while not stop.is_set():
+                for text in ws.messages(timeout=0.5):
+                    if "thumbstick/" not in text and "/click" not in text:
+                        continue
+                    msg = json.loads(text)
+                    side = sides.get(msg.get("device"))
+                    if side is None:
+                        if time.monotonic() - last_lookup > 2:  # the 3D mouse took a hand role, or a new device
+                            sides, last_lookup = vrws.controllers(), time.monotonic()
+                            for path in sides:
+                                ws.subscribe(path)
+                        continue
+                    for name, value in msg.get("components", {}).items():
+                        parts = name.split("/")  # "", "input", component, kind
+                        if len(parts) == 4 and parts[1] == "input" and parts[3] in ("x", "y", "click"):
+                            post(side, parts[2], parts[3], value)
+                if time.monotonic() - last_lookup > 30:
+                    sides, last_lookup = vrws.controllers(), time.monotonic()
+                    for path in sides:
+                        ws.subscribe(path)
+        except (OSError, ValueError) as e:
+            print(f"ft-chord: vrserver: {e}; retrying", file=sys.stderr, flush=True)
+            stop.wait(2)
+
+
+def load_layout():
+    try:
+        with open(CONFIG) as f:
+            return json.load(f)
+    except FileNotFoundError:
+        return LAYOUT
+    except (OSError, ValueError) as e:
+        print(f"ft-chord: {CONFIG}: {e}; using the built-in layout", file=sys.stderr)
+        return LAYOUT
+
+
+def run_hud():
+    import gi
+    gi.require_version("Gtk", "4.0")
+    from gi.repository import GLib, Gtk
+
+    layout = load_layout()
+
+    class Hud(Gtk.ApplicationWindow):
+        def __init__(self, app):
+            super().__init__(application=app, title="Chord keyboard")
+            self.set_default_size(660, 480)
+            self.set_focusable(False)
+            self.area = Gtk.DrawingArea()
+            self.area.set_draw_func(self.draw)
+            self.set_child(self.area)
+            self.chorder = Chorder(layout, self.area.queue_draw)
+            self.stop = threading.Event()
+
+            def post(side, comp, kind, value):
+                GLib.idle_add(self.handle, side, comp, kind, value)
+            threading.Thread(target=read_controllers, args=(post, self.stop), daemon=True).start()
+            self.connect("close-request", self.closing)
+
+        def handle(self, side, comp, kind, value):
+            if comp == "thumbstick" and kind in ("x", "y"):
+                self.chorder.axis(side, 0 if kind == "x" else 1, float(value))
+            elif kind == "click":
+                self.chorder.button(side, comp, bool(value))
+            return False
+
+        def closing(self, *_):
+            self.stop.set()
+            self.chorder.release_all()
+            return False
+
+        def ring(self, cr, cx, cy, radius, labels, lit, centre, font):
+            cr.set_source_rgb(0.23, 0.24, 0.26)
+            cr.arc(cx, cy, radius * 1.32, 0, 2 * math.pi)
+            cr.fill()
+            for i, d in enumerate(DIRS):
+                a = i * math.pi / 4
+                x, y = cx + radius * math.cos(a), cy - radius * math.sin(a)
+                if d == lit:
+                    cr.set_source_rgb(0.36, 0.55, 0.94)
+                    cr.arc(x, y, font * 0.95, 0, 2 * math.pi)
+                    cr.fill()
+                self.text(cr, x, y, labels.get(d, ""), font, (0.93, 0.93, 0.93))
+            self.text(cr, cx, cy, centre, font * 0.8, (0.6, 0.62, 0.66))
+
+        def text(self, cr, x, y, s, size, rgb):
+            if not s:
+                return
+            cr.set_font_size(size if len(s) <= 2 else size * (0.62 if len(s) <= 4 else 0.45))
+            ext = cr.text_extents(s)
+            cr.set_source_rgb(*rgb)
+            cr.move_to(x - ext.x_bearing - ext.width / 2, y - ext.y_bearing - ext.height / 2)
+            cr.show_text(s)
+
+        def caption(self, cr, x, y, s, size, rgb=(0.62, 0.64, 0.68)):
+            cr.set_font_size(size)
+            ext = cr.text_extents(s)
+            cr.set_source_rgb(*rgb)
+            cr.move_to(x - ext.x_advance / 2, y)
+            cr.show_text(s)
+
+        def chip(self, cr, x, y, h, key, what, lit):
+            """A button's name in a rounded box, then what it does; returns the width used."""
+            cr.set_font_size(h * 0.5)
+            kw = cr.text_extents(key).x_advance + h * 0.6
+            cr.set_source_rgb(*((0.36, 0.55, 0.94) if lit else (0.3, 0.31, 0.34)))
+            r = h * 0.25
+            cr.new_sub_path()
+            cr.arc(x + kw - r, y + r, r, -math.pi / 2, 0)
+            cr.arc(x + kw - r, y + h - r, r, 0, math.pi / 2)
+            cr.arc(x + r, y + h - r, r, math.pi / 2, math.pi)
+            cr.arc(x + r, y + r, r, math.pi, 3 * math.pi / 2)
+            cr.close_path()
+            cr.fill()
+            cr.set_source_rgb(0.95, 0.95, 0.95)
+            cr.move_to(x + h * 0.3, y + h * 0.68)
+            cr.show_text(key)
+            cr.set_source_rgb(*((0.55, 0.72, 1.0) if lit else (0.85, 0.85, 0.85)))
+            cr.move_to(x + kw + h * 0.25, y + h * 0.68)
+            cr.show_text(what)
+            return kw + h * 0.25 + cr.text_extents(what).x_advance
+
+        def draw(self, area, cr, w, h):
+            c = self.chorder
+            cr.set_source_rgb(0.12, 0.12, 0.13)
+            cr.paint()
+            cr.select_font_face("sans")
+            cap_h = h * 0.07
+            legend_h = h * 0.27
+            status_h = h * 0.1
+            rings_h = h - cap_h - legend_h - status_h
+            radius = min(w / 4.4, rings_h / 2.75)
+            cy = cap_h + rings_h / 2
+            # captions over the rings
+            self.caption(cr, w * 0.25, cap_h * 0.8, "LEFT stick: hold to pick a group", cap_h * 0.5)
+            self.caption(cr, w * 0.75, cap_h * 0.8, "RIGHT stick: flick, let go = type", cap_h * 0.5)
+            # left: the groups, each shown by its first few characters
+            groups = {d: "".join(v for v in layout.get(d, {}).values() if len(v) == 1)[:3] or
+                      next(iter(layout.get(d, {}).values()), "") for d in DIRS}
+            self.ring(cr, w * 0.25, cy, radius, groups, c.group if c.group != "C" else None,
+                      "etaoinsr" if c.group == "C" else "", radius * 0.3)
+            # right: what each direction types in the current group
+            labels = layout.get(c.group, {})
+            if c.shift != c.caps:
+                labels = {d: (v.upper() if len(v) == 1 else v) for d, v in labels.items()}
+            self.ring(cr, w * 0.75, cy, radius, labels, c.aim, "", radius * 0.36)
+            # status: modifiers and the last few characters typed
+            y0 = cap_h + rings_h
+            mods = [n for n, on in (("Shift", c.shift), ("Caps", c.caps), ("Ctrl", CTRL in c.latched),
+                                    ("Alt", ALT in c.latched)) if on]
+            cr.set_font_size(status_h * 0.55)
+            cr.set_source_rgb(0.36, 0.55, 0.94)
+            cr.move_to(12, y0 + status_h * 0.7)
+            cr.show_text(" ".join(mods) or "")
+            cr.set_source_rgb(0.85, 0.85, 0.85)
+            tail = c.typed[-32:]
+            ext = cr.text_extents(tail + "_")
+            cr.move_to(w - 12 - ext.x_advance, y0 + status_h * 0.7)
+            cr.show_text(tail + "_")
+            # legend: the buttons, lit while their modifier is on
+            cr.set_source_rgb(0.17, 0.17, 0.19)
+            cr.rectangle(0, h - legend_h, w, legend_h)
+            cr.fill()
+            rows = [
+                [("L bumper", "Backspace", False), ("R bumper", "Space", False), ("A", "Enter", False)],
+                [("B", "Shift · 2× Caps", c.shift or c.caps), ("Y", "Ctrl", CTRL in c.latched),
+                 ("X", "Alt", ALT in c.latched), ("D-pad", "arrows", False)],
+                [("View", "tap: close · hold: full keyboard", False)],
+            ]
+            ch = legend_h / len(rows) * 0.72
+            for i, row in enumerate(rows):
+                y = h - legend_h + legend_h / len(rows) * i + (legend_h / len(rows) - ch) / 2
+                x = 12
+                for key, what, lit in row:
+                    x += self.chip(cr, x, y, ch, key, what, lit) + ch * 0.9
+
+    app = Gtk.Application(application_id="local.ft.chord")
+    app.connect("activate", lambda a: (a.get_active_window() or Hud(a)).present())
+    signal.signal(signal.SIGTERM, lambda *_: GLib.idle_add(app.quit))
+    app.run(None)
+
+
+def toggle(argv0):
+    """Close argv0's window if it's open, else open it floating."""
+    running = subprocess.run(["pgrep", "-f", f"^/usr/bin/python3 -I {argv0} --plain$"], capture_output=True, text=True)
+    pids = [int(p) for p in running.stdout.split() if int(p) != os.getpid()]
+    if pids:
+        for pid in pids:
+            os.kill(pid, signal.SIGTERM)
+        return
+    subprocess.run([FT_FLOAT, "run", argv0, "--plain"], capture_output=True)
+
+
+def watch():
+    """The left view button: a tap toggles ft-chord, a hold toggles ft-keyboard."""
+    me = os.path.abspath(sys.argv[0])
+    keyboard = os.path.join(os.path.dirname(me), "ft-keyboard")
+    pressed = {}
+
+    def post(side, comp, kind, value):
+        if (side, comp, kind) != ("left", "view", "click"):
+            return
+        if value:
+            pressed["at"] = time.monotonic()
+        elif "at" in pressed:
+            held = time.monotonic() - pressed.pop("at")
+            target = keyboard if held >= 0.5 else me
+            print(f"ft-chord --watch: view {'held' if held >= 0.5 else 'tapped'}: toggling "
+                  f"{os.path.basename(target)}", flush=True)
+            toggle(target)
+
+    stop = threading.Event()
+    signal.signal(signal.SIGTERM, lambda *_: stop.set())
+    read_controllers(post, stop)
+
+
+def main():
+    if "--watch" in sys.argv:
+        return watch()
+    if "--toggle" in sys.argv:
+        return toggle(os.path.abspath(sys.argv[0]))
+    if "--plain" not in sys.argv and os.path.exists(FT_FLOAT):
+        os.execv(FT_FLOAT, ["ft-float", "run", os.path.abspath(sys.argv[0]), "--plain"])
+    run_hud()
+
+
+if __name__ == "__main__":
+    main()

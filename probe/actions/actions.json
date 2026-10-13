@@ -1,0 +1,113 @@
+{
+ "default_bindings": [
+  {
+   "controller_type": "frame_controller",
+   "binding_url": "bindings_frame_controller.json"
+  }
+ ],
+ "action_sets": [
+  {
+   "name": "/actions/keys",
+   "usage": "hidden"
+  }
+ ],
+ "actions": [
+  {
+   "name": "/actions/keys/in/lpose",
+   "type": "pose"
+  },
+  {
+   "name": "/actions/keys/in/ltrigger",
+   "type": "vector1"
+  },
+  {
+   "name": "/actions/keys/in/lgrip",
+   "type": "vector1"
+  },
+  {
+   "name": "/actions/keys/in/lstick",
+   "type": "vector2"
+  },
+  {
+   "name": "/actions/keys/in/lstickclick",
+   "type": "boolean"
+  },
+  {
+   "name": "/actions/keys/in/lsticktouch",
+   "type": "boolean"
+  },
+  {
+   "name": "/actions/keys/in/lbumper",
+   "type": "boolean"
+  },
+  {
+   "name": "/actions/keys/out/lhaptic",
+   "type": "vibration"
+  },
+  {
+   "name": "/actions/keys/in/rpose",
+   "type": "pose"
+  },
+  {
+   "name": "/actions/keys/in/rtrigger",
+   "type": "vector1"
+  },
+  {
+   "name": "/actions/keys/in/rgrip",
+   "type": "vector1"
+  },
+  {
+   "name": "/actions/keys/in/rstick",
+   "type": "vector2"
+  },
+  {
+   "name": "/actions/keys/in/rstickclick",
+   "type": "boolean"
+  },
+  {
+   "name": "/actions/keys/in/rsticktouch",
+   "type": "boolean"
+  },
+  {
+   "name": "/actions/keys/in/rbumper",
+   "type": "boolean"
+  },
+  {
+   "name": "/actions/keys/out/rhaptic",
+   "type": "vibration"
+  },
+  {
+   "name": "/actions/keys/in/a",
+   "type": "boolean"
+  },
+  {
+   "name": "/actions/keys/in/b",
+   "type": "boolean"
+  },
+  {
+   "name": "/actions/keys/in/x",
+   "type": "boolean"
+  },
+  {
+   "name": "/actions/keys/in/y",
+   "type": "boolean"
+  },
+  {
+   "name": "/actions/keys/in/dpad_up",
+   "type": "boolean"
+  },
+  {
+   "name": "/actions/keys/in/dpad_down",
+   "type": "boolean"
+  },
+  {
+   "name": "/actions/keys/in/dpad_left",
+   "type": "boolean"
+  },
+  {
+   "name": "/actions/keys/in/dpad_right",
+   "type": "boolean"
+  }
+ ],
+ "localization": []
+}
