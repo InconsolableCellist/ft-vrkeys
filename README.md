@@ -12,6 +12,12 @@ ft-chord reads the controllers from vrserver's local web socket (127.0.0.1:27062
 
 ## Install
 
+### Option 1: Recreate it with an AI agent
+
+Give [ft-chord-recreate-prompt.txt](ft-chord-recreate-prompt.txt) to your AI agent of choice on the Steam Frame, along with the two images in `images/`. The prompt covers checking the environment, the setups with and without Frametop, and what I found by testing, so the agent can build ft-chord in one pass.
+
+### Option 2: Install these files
+
 Requires Frametop. It uses the system Python, GTK4 and pycairo, which come with SteamOS.
 
 ```
