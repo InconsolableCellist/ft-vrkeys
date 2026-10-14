@@ -92,7 +92,13 @@ Reading the controllers
   order. No flick is lost, but expect up to ~0.1 s latency. Commit-on-release chording tolerates it.
 - Because the socket only reads, every button still does whatever SteamVR or a game binds it to.
   Don't use the trigger for typing (it clicks wherever SteamVR's laser points). Bumpers, A/B/X/Y and
-  the left d-pad were free on the desktop. A stick flick may also scroll a panel the laser is on.
+  the left d-pad were free on the desktop. The grips are NOT: squeezing one wakes or claims SteamVR's
+  laser, so the first version's Meta-on-grip fought with it. Keys that don't fit on free buttons go on
+  the HUD as laser-clickable keys instead (see section 2).
+- The sticks also scroll whatever panel the laser is on, so scrolling types chords. Only Frametop
+  could stop that (by keeping lasers off while the HUD is open), and the user doesn't want Frametop
+  patched. The answer is a habit: close the HUD (tap the left view button) to scroll, and open it
+  to type. Say so in the README.
 - Haptics aren't available through the socket. Skip them.
 
 Sending keys
@@ -201,30 +207,44 @@ GTK thread):
     right b Shift: one-shot for the next character. A second press within 0.4 s toggles Caps Lock.
       Caps is internal: uppercase letters are sent with Shift, and the system Caps Lock stays off.
     right y Ctrl and right x Alt: latch for the next key; press again to drop.
+    Don't use the grips: squeezing one also wakes or claims SteamVR's laser.
+  HUD keys, clicked with the laser (a Gtk.GestureClick on the drawing area, hit-tested against the
+  rectangles the draw func records), go through the same button path as ("hud", name):
+    Meta (evdev 125): latches for the next key like Ctrl/Alt; a second click while latched sends a
+      plain Meta tap (Plasma's launcher) and drops the latch.
+    Esc, Ins, Del, Home, End, PgUp, PgDn: held down while the click is held.
   Release every held key when the HUD closes.
 - Keep the last ~40 typed characters for the HUD; Backspace trims it. Show shifted symbols as what
   they type (Shift+1 shows "!").
 
-HUD drawing (cairo, dark theme, default 660x480):
+HUD drawing (cairo, dark theme, default 660x540):
 - Top captions: "LEFT stick: hold to pick a group" over the left ring and "RIGHT stick: flick, let go =
   type" over the right ring. Keep them short: a longer left caption got clipped at this width.
 - Left ring: the 8 group labels at their directions (first 3 characters of each group), the current
   group highlighted blue (#5b8def-ish). Centre text "etaoinsr" while the left stick is centred.
 - Right ring: the current group's 8 outputs at their directions (uppercased while Shift xor Caps),
   with the current right-stick direction highlighted.
-- Status line: active modifiers (Shift, Caps, Ctrl, Alt) in blue on the left; the typed tail plus "_"
+- Status line: active modifiers (Shift, Caps, Ctrl, Alt, Meta) in blue on the left; the typed tail plus "_"
   as a cursor on the right ("▏" doesn't render in the default font).
-- Legend (bottom ~27%, slightly lighter background): rounded "keycap" chips plus descriptions, in
+- Legend (bottom ~24%, slightly lighter background): rounded "keycap" chips plus descriptions, in
   3 rows:
     [L bumper] Backspace  [R bumper] Space  [A] Enter
     [B] Shift · 2× Caps   [Y] Ctrl   [X] Alt   [D-pad] arrows
-    [View] tap: close · hold: full keyboard
+    [View] tap: close · hold: full kbd   [Laser] click the keys above
   The B, Y and X chips light up while their modifier is on.
+- Clickable key row between the status line and the legend (~11% of the height): Meta Esc Ins Del
+  Home End PgUp PgDn as 8 equal rounded keys across the width, lit while pressed (Meta while
+  latched). The window has acceptfocus=false, so a laser click on it doesn't take keyboard focus.
+  Under Frametop, also set "pixels": [660, 540] for local.ft.chord in ~/.config/frametop-float.json
+  (with the HUD closed), or it reopens at an older saved size and the row gets squeezed.
 - Check the layout without a headset: factor the drawing into a plain class (or pull the methods out
   with ast), render it to a cairo.ImageSurface PNG, and look at the PNG.
 
 Socket reader thread: loop { connect, open mailbox "ft_chord_<pid>", subscribe both controllers, read
-messages, post (side, component, kind, value) for kind in x/y/click }. On OSError or ValueError, log
+messages, post (side, component, kind, value) for kind in x/y/click }. Subscribe each device path
+only ONCE per connection: subscribing again on a re-lookup adds another subscription, and every
+message then arrives 2, 3, 4... times (a single tap toggled Shift and the watcher repeatedly). Also
+drop click messages whose value didn't change. On OSError or ValueError, log
 and retry after 2 s. Stop on a threading.Event set by close-request or SIGTERM.
 
 ------------------------------------------------------------------------------------------------

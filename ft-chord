@@ -8,7 +8,8 @@ holding the left stick out in a direction first picks another group of 8 (the HU
 A character is typed when the right stick comes back to the centre, so until then you can move
 it to another direction. Buttons (see BUTTONS): right bumper space, left bumper backspace,
 A Enter, B Shift (one shot; twice quickly: Caps Lock), Y Ctrl and X Alt (latch for the next
-key), the left d-pad arrows.
+key), the left d-pad arrows. A row of keys on the HUD, clicked with the laser, has Meta (latches for
+the next key; click it twice for a plain Meta tap), Esc, Ins, Del, Home, End, PgUp and PgDn.
 
 The controllers come from vrserver's local web socket (Frametop's input/vrws.py), which reads
 them whatever has input focus and takes nothing from anyone. SteamVR's own input for overlays
@@ -62,10 +63,14 @@ BUTTONS = {
     ("left", "dpad_up"): "Up", ("left", "dpad_down"): "Down",
     ("left", "dpad_left"): "Left", ("left", "dpad_right"): "Right",
 }
+# Keys on the HUD itself, clicked with a laser (or the mouse); they go through button() as ("hud", name)
+HUD_KEYS = ["Meta", "Esc", "Ins", "Del", "Home", "End", "PgUp", "PgDn"]
+BUTTONS.update({("hud", k): k for k in HUD_KEYS})
+BUTTONS[("hud", "Meta")] = "meta"
 NAMED = {"Space": 57, "Backspace": 14, "Enter": 28, "Tab": 15, "Esc": 1, "Del": 111, "Home": 102,
          "End": 107, "PgUp": 104, "PgDn": 109, "Up": 103, "Down": 108, "Left": 105, "Right": 106,
-         "Ins": 110}
-SHIFT, CTRL, ALT, CAPS = 42, 29, 56, 58
+         "Ins": 110, "Meta": 125}
+SHIFT, CTRL, ALT, CAPS, META = 42, 29, 56, 58, 125
 # US layout: character -> (evdev code, needs shift)
 CHARS = {}
 for row, codes in (("1234567890-=", range(2, 14)), ("qwertyuiop[]", range(16, 28)),
@@ -98,7 +103,7 @@ class Chorder:
         self.shift = False
         self.caps = False
         self.last_shift = 0.0
-        self.latched = set()  # ctrl / alt codes for the next key
+        self.latched = set()  # ctrl / alt / meta codes for the next key
         self.held = {}        # button -> code sent down
         self.typed = ""
 
@@ -174,6 +179,16 @@ class Chorder:
                 self.last_shift = now
                 self.changed()
             return
+        if action == "meta":
+            if down:
+                if META in self.latched:  # twice: a plain Meta tap (the launcher, or whatever it's bound to)
+                    self.latched.discard(META)
+                    self.send(META, 1)
+                    self.send(META, 0)
+                else:
+                    self.latched.add(META)
+                self.changed()
+            return
         if action in ("ctrl", "alt"):
             if down:
                 code = CTRL if action == "ctrl" else ALT
@@ -209,15 +224,27 @@ class Chorder:
 
 
 def read_controllers(post, stop):
-    """vrserver's socket -> post(side, component, value) for sticks and clicks, reconnecting."""
+    """vrserver's socket -> post(side, component, kind, value) for sticks and clicks, reconnecting.
+
+    Each path is subscribed once per connection: subscribing again adds another subscription, and
+    every message then came in twice, three times... (a click toggled Shift on and off again). Clicks
+    are passed on only when they change, in case a duplicate gets through anyway."""
     while not stop.is_set():
         try:
             ws = vrws.VrSocket()
             ws.open(f"ft_chord_{os.getpid()}")
-            sides = vrws.controllers()
-            for path in sides:
-                ws.subscribe(path)
-            last_lookup = time.monotonic()
+            subscribed = set()
+            clicks = {}
+
+            def lookup():
+                found = vrws.controllers()
+                for path in found:
+                    if path not in subscribed:
+                        ws.subscribe(path)
+                        subscribed.add(path)
+                return found, time.monotonic()
+
+            sides, last_lookup = lookup()
             while not stop.is_set():
                 for text in ws.messages(timeout=0.5):
                     if "thumbstick/" not in text and "/click" not in text:
@@ -226,18 +253,19 @@ def read_controllers(post, stop):
                     side = sides.get(msg.get("device"))
                     if side is None:
                         if time.monotonic() - last_lookup > 2:  # the 3D mouse took a hand role, or a new device
-                            sides, last_lookup = vrws.controllers(), time.monotonic()
-                            for path in sides:
-                                ws.subscribe(path)
+                            sides, last_lookup = lookup()
                         continue
                     for name, value in msg.get("components", {}).items():
                         parts = name.split("/")  # "", "input", component, kind
-                        if len(parts) == 4 and parts[1] == "input" and parts[3] in ("x", "y", "click"):
-                            post(side, parts[2], parts[3], value)
+                        if len(parts) != 4 or parts[1] != "input" or parts[3] not in ("x", "y", "click"):
+                            continue
+                        if parts[3] == "click":
+                            if clicks.get((side, parts[2])) == bool(value):
+                                continue
+                            clicks[(side, parts[2])] = bool(value)
+                        post(side, parts[2], parts[3], value)
                 if time.monotonic() - last_lookup > 30:
-                    sides, last_lookup = vrws.controllers(), time.monotonic()
-                    for path in sides:
-                        ws.subscribe(path)
+                    sides, last_lookup = lookup()
         except (OSError, ValueError) as e:
             print(f"ft-chord: vrserver: {e}; retrying", file=sys.stderr, flush=True)
             stop.wait(2)
@@ -264,12 +292,19 @@ def run_hud():
     class Hud(Gtk.ApplicationWindow):
         def __init__(self, app):
             super().__init__(application=app, title="Chord keyboard")
-            self.set_default_size(660, 480)
+            self.set_default_size(660, 540)
             self.set_focusable(False)
             self.area = Gtk.DrawingArea()
             self.area.set_draw_func(self.draw)
             self.set_child(self.area)
             self.chorder = Chorder(layout, self.area.queue_draw)
+            self.key_rects = {}  # HUD key -> (x, y, w, h), set by draw
+            self.clicked = None
+            click = Gtk.GestureClick()
+            click.connect("pressed", self.click_down)
+            click.connect("released", lambda *_: self.click_up())
+            click.connect("cancel", lambda *_: self.click_up())
+            self.area.add_controller(click)
             self.stop = threading.Event()
 
             def post(side, comp, kind, value):
@@ -283,6 +318,20 @@ def run_hud():
             elif kind == "click":
                 self.chorder.button(side, comp, bool(value))
             return False
+
+        def click_down(self, gesture, n, x, y):
+            for key, (kx, ky, kw, kh) in self.key_rects.items():
+                if kx <= x <= kx + kw and ky <= y <= ky + kh:
+                    self.clicked = key
+                    self.chorder.button("hud", key, True)
+                    self.area.queue_draw()
+                    return
+
+        def click_up(self):
+            if self.clicked:
+                self.chorder.button("hud", self.clicked, False)
+                self.clicked = None
+                self.area.queue_draw()
 
         def closing(self, *_):
             self.stop.set()
@@ -346,9 +395,10 @@ def run_hud():
             cr.paint()
             cr.select_font_face("sans")
             cap_h = h * 0.07
-            legend_h = h * 0.27
-            status_h = h * 0.1
-            rings_h = h - cap_h - legend_h - status_h
+            legend_h = h * 0.24
+            status_h = h * 0.09
+            keys_h = h * 0.11
+            rings_h = h - cap_h - legend_h - status_h - keys_h
             radius = min(w / 4.4, rings_h / 2.75)
             cy = cap_h + rings_h / 2
             # captions over the rings
@@ -367,7 +417,7 @@ def run_hud():
             # status: modifiers and the last few characters typed
             y0 = cap_h + rings_h
             mods = [n for n, on in (("Shift", c.shift), ("Caps", c.caps), ("Ctrl", CTRL in c.latched),
-                                    ("Alt", ALT in c.latched)) if on]
+                                    ("Alt", ALT in c.latched), ("Meta", META in c.latched)) if on]
             cr.set_font_size(status_h * 0.55)
             cr.set_source_rgb(0.36, 0.55, 0.94)
             cr.move_to(12, y0 + status_h * 0.7)
@@ -377,6 +427,26 @@ def run_hud():
             ext = cr.text_extents(tail + "_")
             cr.move_to(w - 12 - ext.x_advance, y0 + status_h * 0.7)
             cr.show_text(tail + "_")
+            # clickable keys (with the laser), lit while pressed or, for Meta, latched
+            ky = y0 + status_h + keys_h * 0.12
+            kh = keys_h * 0.76
+            gap = 6
+            kw = (w - 24 - gap * (len(HUD_KEYS) - 1)) / len(HUD_KEYS)
+            self.key_rects = {}
+            for i, key in enumerate(HUD_KEYS):
+                kx = 12 + i * (kw + gap)
+                self.key_rects[key] = (kx, ky, kw, kh)
+                lit = key == self.clicked or (key == "Meta" and META in c.latched)
+                cr.set_source_rgb(*((0.36, 0.55, 0.94) if lit else (0.3, 0.31, 0.34)))
+                r = kh * 0.2
+                cr.new_sub_path()
+                cr.arc(kx + kw - r, ky + r, r, -math.pi / 2, 0)
+                cr.arc(kx + kw - r, ky + kh - r, r, 0, math.pi / 2)
+                cr.arc(kx + r, ky + kh - r, r, math.pi / 2, math.pi)
+                cr.arc(kx + r, ky + r, r, math.pi, 3 * math.pi / 2)
+                cr.close_path()
+                cr.fill()
+                self.text(cr, kx + kw / 2, ky + kh / 2, key, kh * 0.62, (0.95, 0.95, 0.95))
             # legend: the buttons, lit while their modifier is on
             cr.set_source_rgb(0.17, 0.17, 0.19)
             cr.rectangle(0, h - legend_h, w, legend_h)
@@ -385,7 +455,7 @@ def run_hud():
                 [("L bumper", "Backspace", False), ("R bumper", "Space", False), ("A", "Enter", False)],
                 [("B", "Shift · 2× Caps", c.shift or c.caps), ("Y", "Ctrl", CTRL in c.latched),
                  ("X", "Alt", ALT in c.latched), ("D-pad", "arrows", False)],
-                [("View", "tap: close · hold: full keyboard", False)],
+                [("View", "tap: close · hold: full kbd", False), ("Laser", "click the keys above", False)],
             ]
             ch = legend_h / len(rows) * 0.72
             for i, row in enumerate(rows):
