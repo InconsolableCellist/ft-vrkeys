@@ -212,12 +212,15 @@ GTK thread):
   rectangles the draw func records), go through the same button path as ("hud", name):
     Meta (evdev 125): latches for the next key like Ctrl/Alt; a second click while latched sends a
       plain Meta tap (Plasma's launcher) and drops the latch.
-    Esc, Ins, Del, Home, End, PgUp, PgDn: held down while the click is held.
+    Esc, Tab, Ins, Del, Home, End, PgUp, PgDn, F1-F12: held down while the click is held, with any
+      latched Ctrl/Alt/Meta/Shift (Y then F5 = Ctrl+F5, B then Tab = Shift+Tab).
+    F1-F10 are evdev 59-68, F11 87, F12 88.
+  These are buttons, not ring entries, on purpose: the user doesn't want more than 8 per ring.
   Release every held key when the HUD closes.
 - Keep the last ~40 typed characters for the HUD; Backspace trims it. Show shifted symbols as what
   they type (Shift+1 shows "!").
 
-HUD drawing (cairo, dark theme, default 660x540):
+HUD drawing (cairo, dark theme, default 660x600):
 - Top captions: "LEFT stick: hold to pick a group" over the left ring and "RIGHT stick: flick, let go =
   type" over the right ring. Keep them short: a longer left caption got clipped at this width.
 - Left ring: the 8 group labels at their directions (first 3 characters of each group), the current
@@ -226,17 +229,24 @@ HUD drawing (cairo, dark theme, default 660x540):
   with the current right-stick direction highlighted.
 - Status line: active modifiers (Shift, Caps, Ctrl, Alt, Meta) in blue on the left; the typed tail plus "_"
   as a cursor on the right ("▏" doesn't render in the default font).
-- Legend (bottom ~24%, slightly lighter background): rounded "keycap" chips plus descriptions, in
+- Legend (bottom ~21%, slightly lighter background): rounded "keycap" chips plus descriptions, in
   3 rows:
     [L bumper] Backspace  [R bumper] Space  [A] Enter
     [B] Shift · 2× Caps   [Y] Ctrl   [X] Alt   [D-pad] arrows
     [View] tap: close · hold: full kbd   [Laser] click the keys above
   The B, Y and X chips light up while their modifier is on.
-- Clickable key row between the status line and the legend (~11% of the height): Meta Esc Ins Del
-  Home End PgUp PgDn as 8 equal rounded keys across the width, lit while pressed (Meta while
-  latched). The window has acceptfocus=false, so a laser click on it doesn't take keyboard focus.
-  Under Frametop, also set "pixels": [660, 540] for local.ft.chord in ~/.config/frametop-float.json
-  (with the HUD closed), or it reopens at an older saved size and the row gets squeezed.
+- Two clickable key rows between the status line and the legend (~9.5% of the height each):
+    Meta Esc Tab Ins Del Home End PgUp PgDn
+    F1 F2 ... F12
+  Each row's keys are equal width across the window, rounded, lit while pressed (Meta while
+  latched). Draw every key label at one fixed size (~42% of the key height); a length-based size
+  made F1-F9 bigger than F10-F12. The window has acceptfocus=false, so a laser click on it doesn't
+  take keyboard focus.
+- Placement under Frametop: leave it to ft-floatd, which remembers where the user last left it
+  (relative to the main screen); the user prefers that. Don't place it from code: I tried putting
+  it in front of the head on every open, and it was annoyingly close to the face. ft-floatd keeps its
+  saved places in memory and writes them back to ~/.config/frametop-float.json, so editing that file
+  only sticks if ft-floatd is restarted (only do that with nothing floating).
 - Check the layout without a headset: factor the drawing into a plain class (or pull the methods out
   with ast), render it to a cairo.ImageSurface PNG, and look at the PNG.
 
